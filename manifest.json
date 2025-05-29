@@ -1,0 +1,45 @@
+{
+    "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+    "manifestVersion": "1.16",
+    "version": "1.0.0",
+    "id": "ayour id",
+    "packageName": "com.yourcompany.sinhala-transcription-bot",
+    "developer": {
+        "name": "Your Name",
+        "websiteUrl": "https://yourwebsite.com",
+        "privacyUrl": "https://yourwebsite.com/privacy",
+        "termsOfUseUrl": "https://yourwebsite.com/terms"
+    },
+    "icons": {
+        "color": "color.png",
+        "outline": "outline.png"
+    },
+    "name": {
+        "short": "Sinhala Transcription Bot",
+        "full": "Live Sinhala Speech Transcription and Translation Bot"
+    },
+    "description": {
+        "short": "Real-time Sinhala speech transcription and English translation",
+        "full": "A bot that provides live transcription of Sinhala speech with automatic English translation during Teams calls and meetings."
+    },
+    "accentColor": "#FFFFFF",
+    "bots": [
+        {
+            "botId": "your bot id",
+            "scopes": [
+                "personal",
+                "team",
+                "groupchat"
+            ],
+            "supportsFiles": false,
+            "isNotificationOnly": false
+        }
+    ],
+    "permissions": [
+        "identity",
+        "messageTeamMembers"
+    ],
+    "validDomains": [
+        "you rngrok link"
+    ]
+}

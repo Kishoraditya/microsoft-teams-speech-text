@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sinhala Speech Transcription Test</title>
+    <style>
+        /* Keep your existing styles and add these */
+        .live-transcription {
+            background-color: #f8f9fa;
+            border: 2px solid #0078d4;
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+            min-height: 200px;
+        }
+        .partial-result {
+            color: #666;
+            font-style: italic;
+            padding: 5px;
+            background-color: #f0f0f0;
+            border-radius: 3px;
+            margin: 5px 0;
+        }
+        .final-result {
+            background-color: #e8f5e8;
+            border: 1px solid #4caf50;
+            border-radius: 5px;
+            padding: 10px;
+            margin: 10px 0;
+        }
+        .connection-status {
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+            font-weight: bold;
+        }
+        .connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .recording-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background-color: #d13438;
+            border-radius: 50%;
+            animation: pulse 1s infinite;
+            margin-right: 8px;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 Sinhala Speech Transcription Test</h1>
+        
+        <!-- Health Check Section -->
+        <div class="section">
+            <h2>Bot Status</h2>
+            <button onclick="checkHealth()">Check Bot Health</button>
+            <div id="healthStatus"></div>
+        </div>
+
+        <!-- Live Transcription Section -->
+        <div class="section">
+            <h2>🔴 Live Transcription</h2>
+            <div id="connectionStatus" class="connection-status disconnected">
+                Disconnected
+            </div>
+            
+            <button id="connectBtn" onclick="connectWebSocket()">Connect</button>
+            <button id="startLiveBtn" onclick="startLiveTranscription()" disabled>Start Live Transcription</button>
+            <button id="stopLiveBtn" onclick="stopLiveTranscription()" disabled>Stop Live Transcription</button>
+            
+            <div class="live-transcription" id="liveResults">
+                <p><em>Live transcription results will appear here...</em></p>
+            </div>
+        </div>
+
+        <!-- Keep your existing sections... -->
+        <!-- Audio Recording Section -->
+        <div class="section">
+            <h2>Audio Recording Test</h2>
+            <button id="recordBtn" onclick="toggleRecording()">Start Recording</button>
+            <button onclick="stopRecording()" id="stopBtn" disabled>Stop Recording</button>
+            <div id="recordingStatus"></div>
+            <audio id="audioPlayback" controls style="width: 100%; margin-top: 10px;"></audio>
+        </div>
+
+        <!-- Text Translation Test -->
+        <div class="section">
+            <h2>Translation Test</h2>
+            <textarea id="sinhalaText" placeholder="Enter Sinhala text here for translation test..."></textarea>
+            <button onclick="testTranslation()">Translate to English</button>
+            <div id="translationResult"></div>
+        </div>
+
+        <!-- Session Management -->
+        <div class="section">
+            <h2>Session Management</h2>
+            <input type="text" id="sessionId" placeholder="Session ID (optional)" style="width: 200px; padding: 8px;">
+            <button onclick="startSession()">Start Session</button>
+            <button onclick="stopSession()">Stop Session</button>
+            <button onclick="getSessionData()">Get Session Data</button>
+            <div id="sessionResult"></div>
+        </div>
+
+        <!-- Transcription Results -->
+        <div class="section">
+            <h2>Transcription Results</h2>
+            <div id="transcriptionResults"></div>
+        </div>
+    </div>
+
+    <script>
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+        let currentSessionId = null;
+        
+        // WebSocket variables
+        let ws = null;
+        let isConnected = false;
+        let isLiveTranscribing = false;
+        let audioContext = null;
+        let processor = null;
+        let microphone = null;
+
+        // WebSocket functions
+        function connectWebSocket() {
+            try {
+                const wsUrl = `ws://localhost:8080/ws`;
+                ws = new WebSocket(wsUrl);
+                
+                ws.onopen = function(event) {
+                    isConnected = true;
+                    updateConnectionStatus('Connected', 'connected');
+                    document.getElementById('connectBtn').disabled = true;
+                    document.getElementById('startLiveBtn').disabled = false;
+                };
+                
+                ws.onmessage = function(event) {
+                    const data = JSON.parse(event.data);
+                    handleWebSocketMessage(data);
+                };
+                
+                ws.onclose = function(event) {
+                    isConnected = false;
+                    updateConnectionStatus('Disconnected', 'disconnected');
+                    document.getElementById('connectBtn').disabled = false;
+                    document.getElementById('startLiveBtn').disabled = true;
+                    document.getElementById('stopLiveBtn').disabled = true;
+                };
+                
+                ws.onerror = function(error) {
+                    console.error('WebSocket error:', error);
+                    updateConnectionStatus('Connection Error', 'disconnected');
+                };
+                
+            } catch (error) {
+                console.error('Failed to connect:', error);
+                updateConnectionStatus('Connection Failed', 'disconnected');
+            }
+        }
+
+        function updateConnectionStatus(message, className) {
+            const statusDiv = document.getElementById('connectionStatus');
+            statusDiv.textContent = message;
+            statusDiv.className = `connection-status ${className}`;
+        }
+
+        function handleWebSocketMessage(data) {
+            const liveResults = document.getElementById('liveResults');
+            
+            switch(data.type) {
+                case 'transcription_started':
+                    liveResults.innerHTML = '<p><em>🎤 Listening for Sinhala speech...</em></p>';
+                    break;
+                    
+                case 'partial_result':
+                    updatePartialResult(data.text);
+                    break;
+                    
+                case 'final_result':
+                    addFinalResult(data);
+                    break;
+                    
+                case 'transcription_stopped':
+                    liveResults.innerHTML += '<p><em>✅ Transcription stopped</em></p>';
+                    break;
+                    
+                case 'error':
+                    liveResults.innerHTML += `<div class="status error">Error: ${data.message}</div>`;
+                    break;
+            }
+        }
+
+        function updatePartialResult(text) {
+            const liveResults = document.getElementById('liveResults');
+            
+            // Remove previous partial result
+            const existingPartial = liveResults.querySelector('.partial-result');
+            if (existingPartial) {
+                existingPartial.remove();
+            }
+            
+            // Add new partial result
+            const partialDiv = document.createElement('div');
+            partialDiv.className = 'partial-result';
+            partialDiv.innerHTML = `<span class="recording-indicator"></span><strong>Listening:</strong> ${text}`;
+            liveResults.appendChild(partialDiv);
+            
+            // Auto-scroll to bottom
+            liveResults.scrollTop = liveResults.scrollHeight;
+        }
+
+        function addFinalResult(data) {
+            const liveResults = document.getElementById('liveResults');
+            
+            // Remove any partial results
+            const existingPartial = liveResults.querySelector('.partial-result');
+            if (existingPartial) {
+                existingPartial.remove();
+            }
+            
+            // Add final result
+            const resultDiv = document.createElement('div');
+            resultDiv.className = 'final-result';
+            resultDiv.innerHTML = `
+                <div style="margin-bottom: 10px;">
+                    <strong>🕐 ${new Date(data.timestamp).toLocaleTimeString()}</strong>
+                </div>
+                <div style="margin-bottom: 8px;">
+                    <strong>🇱🇰 Sinhala:</strong> ${data.original.text}
+                </div>
+                <div style="margin-bottom: 8px;">
+                    <strong>🇺🇸 English:</strong> ${data.translated.text}
+                </div>
+                <div style="font-size: 0.9em; color: #666;">
+                    Session: ${data.session_id}
+                </div>
+            `;
+            liveResults.appendChild(resultDiv);
+            
+            // Auto-scroll to bottom
+            liveResults.scrollTop = liveResults.scrollHeight;
+        }
+
+        async function startLiveTranscription() {
+            if (!isConnected) {
+                alert('Please connect to WebSocket first');
+                return;
+            }
+            
+            try {
+                // Get microphone access
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    } 
+                });
+                
+                // Set up audio processing
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000
+                });
+                
+                microphone = audioContext.createMediaStreamSource(stream);
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                processor.onaudioprocess = function(event) {
+                    if (isLiveTranscribing && ws && ws.readyState === WebSocket.OPEN) {
+                        const inputBuffer = event.inputBuffer.getChannelData(0);
+                        
+                        // Convert float32 to int16
+                        const int16Buffer = new Int16Array(inputBuffer.length);
+                        for (let i = 0; i < inputBuffer.length; i++) {
+                            int16Buffer[i] = Math.max(-32768, Math.min(32767, inputBuffer[i] * 32768));
+                        }
+                        
+                        // Send audio data to WebSocket
+                        ws.send(int16Buffer.buffer);
+                    }
+                };
+                
+                microphone.connect(processor);
+                processor.connect(audioContext.destination);
+                
+                // Start transcription
+                ws.send(JSON.stringify({ type: 'start_transcription' }));
+                
+                isLiveTranscribing = true;
+                document.getElementById('startLiveBtn').disabled = true;
+                document.getElementById('stopLiveBtn').disabled = false;
+                document.getElementById('startLiveBtn').textContent = 'Transcribing...';
+                
+                updateConnectionStatus('🔴 Live Transcribing', 'connected');
+                
+            } catch (error) {
+                console.error('Error starting live transcription:', error);
+                alert('Error accessing microphone: ' + error.message);
+            }
+        }
+
+        function stopLiveTranscription() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'stop_transcription' }));
+            }
+            
+            // Clean up audio processing
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+            if (microphone) {
+                microphone.disconnect();
+                microphone = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            
+            isLiveTranscribing = false;
+            document.getElementById('startLiveBtn').disabled = false;
+            document.getElementById('stopLiveBtn').disabled = true;
+            document.getElementById('startLiveBtn').textContent = 'Start Live Transcription';
+            
+            updateConnectionStatus('Connected', 'connected');
+        }
+
+        // Keep all your existing functions...
+        
+        // Check bot health
+        async function checkHealth() {
+            try {
+                const response = await fetch('/health');
+                const data = await response.json();
+                document.getElementById('healthStatus').innerHTML = `
+                    <div class="status success">
+                        <strong>Bot Status:</strong> ${data.status}<br>
+                        <strong>Active Sessions:</strong> ${data.active_sessions}<br>
+                        <strong>Timestamp:</strong> ${data.timestamp}
+                    </div>
+                `;
+            } catch (error) {
+                document.getElementById('healthStatus').innerHTML = `
+                    <div class="status error">
+                        <strong>Error:</strong> ${error.message}
+                    </div>
+                `;
+            }
+        }
+
+        // Audio recording functions (keep existing ones)
+        async function toggleRecording() {
+            if (!isRecording) {
+                await startRecording();
+            }
+        }
+
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = event => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                    const audioUrl = URL.createObjectURL(audioBlob);
+                    document.getElementById('audioPlayback').src = audioUrl;
+                    
+                    processAudioForTranscription(audioBlob);
+                };
+
+                mediaRecorder.start();
+                isRecording = true;
+                
+                document.getElementById('recordBtn').textContent = 'Recording...';
+                document.getElementById('recordBtn').classList.add('recording');
+                document.getElementById('recordBtn').disabled = true;
+                document.getElementById('stopBtn').disabled = false;
+                
+                document.getElementById('recordingStatus').innerHTML = `
+                    <div class="status info">🔴 Recording in progress...</div>
+                `;
+            } catch (error) {
+                document.getElementById('recordingStatus').innerHTML = `
+                    <div class="status error">Error accessing microphone: ${error.message}</div>
+                `;
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                isRecording = false;
+                
+                document.getElementById('recordBtn').textContent = 'Start Recording';
+                document.getElementById('recordBtn').classList.remove('recording');
+                document.getElementById('recordBtn').disabled = false;
+                document.getElementById('stopBtn').disabled = true;
+                
+                document.getElementById('recordingStatus').innerHTML = `
+                    <div class="status success">✅ Recording stopped. Processing...</div>
+                `;
+            }
+        }
+
+        async function processAudioForTranscription(audioBlob) {
+            document.getElementById('transcriptionResults').innerHTML += `
+                <div class="result">
+                    <strong>Audio Recorded:</strong> ${new Date().toLocaleTimeString()}<br>
+                    <strong>Size:</strong> ${(audioBlob.size / 1024).toFixed(2)} KB<br>
+                    <em>Note: Use Live Transcription for real-time results</em>
+                </div>
+            `;
+        }
+
+        // Test translation
+        async function testTranslation() {
+            const sinhalaText = document.getElementById('sinhalaText').value;
+            if (!sinhalaText.trim()) {
+                alert('Please enter some Sinhala text');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/translate', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        text: sinhalaText,
+                        from: 'si',
+                        to: 'en'
+                    })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('translationResult').innerHTML = `
+                        <div class="result">
+                            <strong>Original (Sinhala):</strong> ${sinhalaText}<br>
+                            <strong>Translation (English):</strong> ${data.translation}
+                        </div>
+                    `;
+                } else {
+                    throw new Error('Translation service not available');
+                }
+            } catch (error) {
+                document.getElementById('translationResult').innerHTML = `
+                    <div class="result">
+                        <strong>Original (Sinhala):</strong> ${sinhalaText}<br>
+                        <strong>Mock Translation (English):</strong> [Translation would appear here when Azure services are connected]<br>
+                        <em>Error: ${error.message}</em>
+                    </div>
+                `;
+            }
+        }
+
+        // Session management functions (keep existing ones)
+        async function startSession() {
+            const sessionId = document.getElementById('sessionId').value || `test-session-${Date.now()}`;
+            currentSessionId = sessionId;
+            
+            try {
+                const response = await fetch('/api/messages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        type: 'message',
+                        text: 'start transcription',
+                        conversation: { id: sessionId }
+                    })
+                });
+
+                document.getElementById('sessionResult').innerHTML = `
+                    <div class="status success">
+                        ✅ Session started: ${sessionId}
+                    </div>
+                `;
+            } catch (error) {
+                document.getElementById('sessionResult').innerHTML = `
+                    <div class="status error">
+                        Error starting session: ${error.message}
+                    </div>
+                `;
+            }
+        }
+
+        async function stopSession() {
+            if (!currentSessionId) {
+                alert('No active session');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/messages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        type: 'message',
+                        text: 'stop transcription',
+                        conversation: { id: currentSessionId }
+                    })
+                });
+
+                document.getElementById('sessionResult').innerHTML = `
+                    <div class="status success">
+                        ✅ Session stopped: ${currentSessionId}
+                    </div>
+                `;
+            } catch (error) {
+                document.getElementById('sessionResult').innerHTML = `
+                    <div class="status error">
+                        Error stopping session: ${error.message}
+                    </div>
+                `;
+            }
+        }
+
+        async function getSessionData() {
+            const sessionId = currentSessionId || document.getElementById('sessionId').value;
+            if (!sessionId) {
+                alert('Please enter a session ID');
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/sessions/${sessionId}`);
+                const data = await response.json();
+                
+                if (response.ok) {
+                    document.getElementById('sessionResult').innerHTML = `
+                        <div class="status success">
+                            <strong>Session Data:</strong><br>
+                            <pre>${JSON.stringify(data, null, 2)}</pre>
+                        </div>
+                    `;
+                } else {
+                    document.getElementById('sessionResult').innerHTML = `
+                        <div class="status error">
+                            Session not found: ${sessionId}
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                document.getElementById('sessionResult').innerHTML = `
+                    <div class="status error">
+                        Error getting session data: ${error.message}
+                    </div>
+                `;
+            }
+        }
+
+        // Auto-check health on page load
+        window.onload = function() {
+            checkHealth();
+        };
+
+        // Clean up on page unload
+        window.onbeforeunload = function() {
+            if (isLiveTranscribing) {
+                stopLiveTranscription();
+            }
+            if (ws) {
+                ws.close();
+            }
+        };
+
+        function debugLog(message) {
+            console.log('[DEBUG]', message);
+            const liveResults = document.getElementById('liveResults');
+            liveResults.innerHTML += `<div style="color: #666; font-size: 0.8em;">[DEBUG] ${message}</div>`;
+        }
+
+        // Update the audio processing function
+        processor.onaudioprocess = function(event) {
+            if (isLiveTranscribing && ws && ws.readyState === WebSocket.OPEN) {
+                const inputBuffer = event.inputBuffer.getChannelData(0);
+                
+                // Check if there's actual audio
+                const volume = Math.sqrt(inputBuffer.reduce((sum, sample) => sum + sample * sample, 0) / inputBuffer.length);
+                if (volume > 0.01) { // Only log when there's significant audio
+                    debugLog(`Audio detected: volume=${volume.toFixed(4)}`);
+                }
+                
+                // Convert float32 to int16
+                const int16Buffer = new Int16Array(inputBuffer.length);
+                for (let i = 0; i < inputBuffer.length; i++) {
+                    int16Buffer[i] = Math.max(-32768, Math.min(32767, inputBuffer[i] * 32768));
+                }
+                
+                // Send audio data to WebSocket
+                ws.send(int16Buffer.buffer);
+            }
+        };
+    </script>
+</body>
+</html>

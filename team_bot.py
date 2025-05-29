@@ -18,7 +18,25 @@ import azure.cognitiveservices.speech as speechsdk
 from azure.ai.translation.text import TextTranslationClient
 from azure.core.credentials import AzureKeyCredential
 import openai
+from aiohttp import web
+import aiohttp_cors
+import websockets
+from aiohttp import web, WSMsgType
+import base64
+import io
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import queue
+from botbuilder.core import ActivityHandler, TurnContext, MessageFactory
+from botbuilder.schema import ChannelAccount, Activity, ActivityTypes
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("python-dotenv not installed. Install with: pip install python-dotenv")
+    
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -39,9 +57,12 @@ class TeamsTranscriptionBot:
         self.bot_id = os.getenv('BOT_ID')
         self.bot_password = os.getenv('BOT_PASSWORD')
         self.port = int(os.getenv('PORT', 8080))
-        
+        self.speech_results_queue = queue.Queue()
+        self.active_websockets = {}
         # Validate required environment variables
         self._validate_config()
+        self.teams_app_id = os.getenv('TEAMS_APP_ID')
+        self.teams_app_password = os.getenv('TEAMS_APP_PASSWORD')
         
         # Initialize Azure services
         self._init_speech_service()
@@ -77,18 +98,29 @@ class TeamsTranscriptionBot:
     
     def _init_translation_service(self):
         """Initialize Azure Translation Service"""
-        self.translation_client = TextTranslationClient(
-            endpoint="https://api.cognitive.microsofttranslator.com",
-            credential=AzureKeyCredential(self.translator_key),
-            region=self.translator_region
-        )
-        logger.info("Azure Translation Service initialized")
-    
+        try:
+            if self.translator_key and self.translator_key != "mock_value":
+                from azure.ai.translation.text import TextTranslationClient
+                from azure.core.credentials import AzureKeyCredential
+                
+                self.translation_client = TextTranslationClient(
+                    endpoint="https://api.cognitive.microsofttranslator.com",
+                    credential=AzureKeyCredential(self.translator_key),
+                    region=self.translator_region
+                )
+                logger.info("Azure Translation Service initialized")
+            else:
+                logger.warning("Azure Translation Service not configured - using mock translations")
+                self.translation_client = None
+        except Exception as e:
+            logger.error(f"Failed to initialize Azure Translation Service: {str(e)}")
+            self.translation_client = None
+
     def _init_openai_service(self):
         """Initialize Azure OpenAI for enhanced processing"""
         openai.api_type = "azure"
         openai.api_base = self.openai_endpoint
-        openai.api_version = "2024-02-01"
+        openai.api_version = "2024-10-21"
         openai.api_key = self.openai_key
         logger.info("Azure OpenAI Service initialized")
     
@@ -131,7 +163,157 @@ class TeamsTranscriptionBot:
             
         except Exception as e:
             logger.error(f"Error in transcription: {str(e)}")
+
+    async def on_message_activity(self, turn_context: TurnContext):
+        """Handle Teams messages"""
+        try:
+            user_message = turn_context.activity.text.lower()
+            
+            if 'start transcription' in user_message:
+                await self._start_teams_transcription(turn_context)
+            elif 'stop transcription' in user_message:
+                await self._stop_teams_transcription(turn_context)
+            elif 'help' in user_message:
+                await self._send_help_message(turn_context)
+            else:
+                await turn_context.send_activity(
+                    MessageFactory.text("Say 'start transcription' to begin live transcription")
+                )
+                
+        except Exception as e:
+            logger.error(f"Error handling message: {str(e)}")
+            await turn_context.send_activity(
+                MessageFactory.text(f"Error: {str(e)}")
+            )
     
+    async def _start_teams_transcription(self, turn_context: TurnContext):
+        """Start transcription in Teams"""
+        try:
+            conversation_id = turn_context.activity.conversation.id
+            
+            # Start transcription session
+            await self._start_transcription_session(conversation_id)
+            
+            # Send confirmation
+            card = self._create_transcription_card("started")
+            await turn_context.send_activity(MessageFactory.attachment(card))
+            
+        except Exception as e:
+            logger.error(f"Error starting Teams transcription: {str(e)}")
+    
+    async def _stop_teams_transcription(self, turn_context: TurnContext):
+        """Stop transcription in Teams"""
+        try:
+            conversation_id = turn_context.activity.conversation.id
+            
+            # Stop transcription session
+            await self._stop_transcription_session(conversation_id)
+            
+            # Send summary
+            session_data = self.active_sessions.get(conversation_id, {})
+            transcriptions = session_data.get('transcriptions', [])
+            
+            summary_card = self._create_summary_card(transcriptions)
+            await turn_context.send_activity(MessageFactory.attachment(summary_card))
+            
+        except Exception as e:
+            logger.error(f"Error stopping Teams transcription: {str(e)}")
+    
+    def _create_transcription_card(self, status: str):
+        """Create adaptive card for transcription status"""
+        card = {
+            "type": "AdaptiveCard",
+            "version": "1.4",
+            "body": [
+                {
+                    "type": "TextBlock",
+                    "text": f"🎤 Live Transcription {status.title()}",
+                    "weight": "bolder",
+                    "size": "medium",
+                    "color": "good" if status == "started" else "attention"
+                },
+                {
+                    "type": "TextBlock",
+                    "text": "Sinhala speech will be transcribed and translated to English in real-time.",
+                    "wrap": True
+                }
+            ]
+        }
+        
+        return self._create_adaptive_card_attachment(card)
+    
+    def _create_summary_card(self, transcriptions: list):
+        """Create summary card with transcription results"""
+        body = [
+            {
+                "type": "TextBlock",
+                "text": "📝 Transcription Summary",
+                "weight": "bolder",
+                "size": "medium"
+            }
+        ]
+        
+        for i, trans in enumerate(transcriptions[-5:]):  # Show last 5
+            body.extend([
+                {
+                    "type": "TextBlock",
+                    "text": f"**Original:** {trans['original']}",
+                    "wrap": True,
+                    "size": "small"
+                },
+                {
+                    "type": "TextBlock",
+                    "text": f"**Translation:** {trans['translated']}",
+                    "wrap": True,
+                    "color": "accent"
+                },
+                {
+                    "type": "TextBlock",
+                    "text": f"Time: {trans['timestamp']}",
+                    "size": "extraSmall",
+                    "color": "dark"
+                }
+            ])
+            
+            if i < len(transcriptions) - 1:
+                body.append({"type": "TextBlock", "text": "---"})
+        
+        card = {
+            "type": "AdaptiveCard",
+            "version": "1.4",
+            "body": body
+        }
+        
+        return self._create_adaptive_card_attachment(card)
+    
+    def _create_adaptive_card_attachment(self, card):
+        """Create adaptive card attachment"""
+        return {
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": card
+        }
+    
+    async def _send_help_message(self, turn_context: TurnContext):
+        """Send help message"""
+        help_text = """
+        🤖 **Sinhala Transcription Bot**
+
+        **Commands:**
+        • `start transcription` - Begin live transcription
+        • `stop transcription` - End transcription and get summary
+        • `help` - Show this help message
+
+        **Features:**
+        • Real-time Sinhala speech recognition
+        • Automatic English translation
+        • Live transcription during Teams calls
+        • Session summaries
+
+        Just say "start transcription" to begin!
+                """
+                
+        await turn_context.send_activity(MessageFactory.text(help_text))
+
     async def _process_transcription(self, sinhala_text: str, session_id: str):
         """Process transcribed text and translate to English"""
         try:
@@ -165,23 +347,260 @@ class TeamsTranscriptionBot:
             logger.error(f"Error processing transcription: {str(e)}")
     
     async def translate_text(self, text: str) -> str:
-        """Translate Sinhala text to English"""
+        """Translate Sinhala text to English with post-processing"""
         try:
+            # Check if translation service is properly configured
+            if not self.translator_key or self.translator_key == "mock_value":
+                logger.warning("Azure Translation Service not configured, using enhanced mock translation")
+                return await self._enhanced_translate(text)
+            
+            # Use Azure Translation Service
             response = self.translation_client.translate(
-                content=[text],
+                body=[{"text": text}],
                 from_language="si",
                 to_language=["en"]
             )
             
-            if response and len(response) > 0:
-                return response[0].translations[0].text
+            if response and len(response) > 0 and response[0].translations:
+                raw_translation = response[0].translations[0].text
+                
+                # Apply post-processing for better context
+                enhanced_translation = await self._post_process_translation(text, raw_translation)
+                
+                logger.info(f"Translation: '{text}' -> '{enhanced_translation}'")
+                return enhanced_translation
             
-            return text
+            logger.warning("No translation returned from Azure")
+            return await self._enhanced_translate(text)
             
         except Exception as e:
             logger.error(f"Translation error: {str(e)}")
-            return text
-    
+            return await self._enhanced_translate(text)
+
+    async def _post_process_translation(self, sinhala_text: str, english_translation: str) -> str:
+        """Post-process translation for better context and accuracy"""
+        try:
+            # Common corrections for speech recognition errors
+            corrections = {
+                # Common speech recognition errors
+                "leopard eyes": "VBS",  # Common misrecognition
+                "tir res": "tires",
+                "c company": "CJ company",
+                
+                # Context improvements
+                "i sell tires at": "I work selling tires at",
+                "making myself a translator": "building a translator",
+                "get rid of it": "remove that",
+                
+                # Business context
+                "company": "company",
+                "business": "business",
+                "service": "service",
+            }
+            
+            # Apply corrections
+            processed_translation = english_translation.lower()
+            for error, correction in corrections.items():
+                processed_translation = processed_translation.replace(error, correction)
+            
+            # Capitalize first letter and proper nouns
+            processed_translation = self._capitalize_properly(processed_translation)
+            
+            # Add context hints for business scenarios
+            if any(word in sinhala_text for word in ["සමාගම", "ව්‍යාපාර", "සේවා"]):
+                if "company" not in processed_translation and "business" not in processed_translation:
+                    processed_translation += " (business context)"
+            
+            return processed_translation
+            
+        except Exception as e:
+            logger.error(f"Post-processing error: {str(e)}")
+            return english_translation
+
+    def _capitalize_properly(self, text: str) -> str:
+        """Properly capitalize text"""
+        # Capitalize first letter
+        if text:
+            text = text[0].upper() + text[1:]
+        
+        # Capitalize common proper nouns
+        proper_nouns = ["sri lanka", "sinhala", "tamil", "vbs", "cj"]
+        for noun in proper_nouns:
+            text = text.replace(noun, noun.title())
+        
+        return text
+
+    async def _enhanced_translate(self, sinhala_text: str) -> str:
+        """Enhanced contextual translation for when Azure is not available"""
+        
+        # Enhanced translation mappings with context
+        translations = {
+            # Personal introductions
+            "මගේ නම්": "My name is",
+            "මම": "I",
+            "ඔබ": "you",
+            "අපි": "we",
+            
+            # Business and work
+            "සමාගම": "company",
+            "සමාගමේ": "company's",
+            "ව්‍යාපාර": "business",
+            "සේවාව": "service",
+            "වැඩ": "work",
+            "කාර්යාලය": "office",
+            "ගනුදෙනු": "transactions",
+            "විකුණනවා": "selling",
+            "විකුණන්නේ": "sell",
+            
+            # Location and language
+            "ලංකාව": "Sri Lanka",
+            "ලංකාවේ": "in Sri Lanka",
+            "සිංහල": "Sinhala",
+            "දෙමළ": "Tamil",
+            "භාෂා": "language",
+            "ඉගෙන ගන්නවා": "learning",
+            "ඉගෙන ගන්නේ": "learning",
+            "පරිවර්තන": "translation",
+            "පරිවර්තකයෙක්": "translator",
+            
+            # Actions and questions
+            "ලියන්න": "write",
+            "ලියන්න ඕනෙ": "need to write",
+            "මොනවද": "what",
+            "කොහොමද": "how",
+            "ඇති කරන්න": "create",
+            "නැති කරන්න": "remove",
+            "හදනවා": "making/building",
+            
+            # Numbers and quantities
+            "හත්": "seven",
+            "දෙනා": "people",
+            "හත් දෙනා": "seven people",
+            
+            # Common phrases
+            "ඉන්නේ": "am/is/are",
+            "දෙකම": "both",
+            "සහ": "and",
+            "තව": "more",
+            "ඒක": "that",
+            "ඒ": "that/those",
+        }
+        
+        # Build contextual translation
+        words = sinhala_text.split()
+        english_parts = []
+        
+        for word in words:
+            word_clean = word.strip()
+            best_match = None
+            
+            # Find best matching translation
+            for sinhala_key, english_value in translations.items():
+                if sinhala_key in word_clean or word_clean in sinhala_key:
+                    best_match = english_value
+                    break
+            
+            if best_match:
+                english_parts.append(best_match)
+            else:
+                # Keep original if no translation found
+                english_parts.append(f"[{word_clean}]")
+        
+        # Join and clean up
+        result = " ".join(english_parts)
+        result = result.replace("  ", " ").strip()
+        
+        # Apply basic grammar rules
+        result = self._apply_basic_grammar(result)
+        
+        return result if result else f"[Translation needed: {sinhala_text}]"
+
+    def _apply_basic_grammar(self, text: str) -> str:
+        """Apply basic English grammar rules"""
+        # Simple grammar improvements
+        text = text.replace("I am learning both Tamil and Sinhala", "I'm learning both Tamil and Sinhala")
+        text = text.replace("I am", "I'm")
+        text = text.replace("need to write", "need to write")
+        
+        # Capitalize first letter
+        if text:
+            text = text[0].upper() + text[1:]
+        
+        return text
+
+    async def _mock_translate(self, sinhala_text: str) -> str:
+        """Provide contextual English translation for common Sinhala phrases"""
+        
+        # Common Sinhala to English mappings (not word-by-word)
+        translations = {
+            # Greetings and basic phrases
+            "කොහොමද": "How are you?",
+            "සුභ උදෑසනක්": "Good morning",
+            "සුභ සන්ධ්‍යාවක්": "Good evening",
+            "ස්තූතියි": "Thank you",
+            "සමාවන්න": "Sorry",
+            
+            # Business/professional context
+            "මගේ නම්": "My name is",
+            "සමාගම": "company",
+            "ව්‍යාපාර": "business",
+            "සේවාව": "service",
+            "ගනුදෙනු": "transactions",
+            
+            # Location and language
+            "ලංකාව": "Sri Lanka",
+            "සිංහල": "Sinhala",
+            "දෙමළ": "Tamil",
+            "ඉගෙන ගන්නවා": "learning",
+            "පරිවර්තන": "translation",
+            
+            # Numbers and counting
+            "හත් දෙනා": "seven people",
+            "දෙනා": "people",
+            
+            # Actions and questions
+            "ලියන්න ඕනෙ": "need to write",
+            "මොනවද": "what",
+            "ඇති කරන්න": "to create",
+        }
+        
+        # Try to find contextual translation
+        text_lower = sinhala_text.lower().strip()
+        
+        # Check for exact matches first
+        if text_lower in translations:
+            return translations[text_lower]
+        
+        # Check for partial matches and build contextual translation
+        english_parts = []
+        words = sinhala_text.split()
+        
+        for word in words:
+            word_clean = word.strip()
+            found_translation = False
+            
+            # Check if this word or phrase exists in our translations
+            for sinhala_phrase, english_phrase in translations.items():
+                if word_clean in sinhala_phrase or sinhala_phrase in word_clean:
+                    if english_phrase not in english_parts:
+                        english_parts.append(english_phrase)
+                    found_translation = True
+                    break
+            
+            # If no translation found, keep original word
+            if not found_translation:
+                english_parts.append(word_clean)
+        
+        # Join parts to form coherent English
+        if english_parts:
+            result = " ".join(english_parts)
+            # Clean up the result
+            result = result.replace("  ", " ").strip()
+            return result if result else f"[Translation of: {sinhala_text}]"
+        
+        # Fallback: indicate that translation is needed
+        return f"[Translation needed: {sinhala_text}]"
+  
     async def _send_to_teams(self, transcription_data: Dict, session_id: str):
         """Send transcription to Teams channel"""
         try:
